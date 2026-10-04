@@ -1,41 +1,57 @@
 import json
-from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from app.database import get_db
-from app.models.models import Candidate, Hall, SeatPlan
-from app.services.seat_engine import find_violations, place_candidates, plan_to_dict
+from app.models.models import SeatPlan
+from app.services.seating_service import SeatingRejected, run_seating
+
 router = APIRouter(prefix="/seating", tags=["seating"])
 
+
+def _rejected(exc: SeatingRejected) -> HTTPException:
+    status = 404 if exc.code == "not_found" else 400
+    return HTTPException(status, {"code": exc.code, "detail": str(exc)})
+
+
 @router.post("/run")
-def run_seating(hall_id: int = 1, db: Session = Depends(get_db)):
-    hall = db.get(Hall, hall_id)
-    if not hall: raise HTTPException(404, "考室不存在")
-    cands = [{"id": c.id, "name": c.name, "ticket_no": c.ticket_no, "paper_id": c.paper_id}
-             for c in db.scalars(select(Candidate).where(Candidate.hall_id == hall_id)).all()]
-    assigns, unplaced = place_candidates(hall.rows, hall.cols, hall.min_manhattan, cands)
-    viols = find_violations(hall.rows, hall.cols, hall.min_manhattan, assigns)
-    result = plan_to_dict(assigns, unplaced, viols, hall.rows, hall.cols)
-    result["hall"] = {"id": hall.id, "name": hall.name, "min_manhattan": hall.min_manhattan}
-    plan = SeatPlan(hall_id=hall_id, created_at=datetime.utcnow(), result_json=json.dumps(result, ensure_ascii=False))
-    db.add(plan); db.commit(); db.refresh(plan)
+def run(hall_id: int = 1, db: Session = Depends(get_db)):
+    try:
+        plan, result = run_seating(db, hall_id)
+    except SeatingRejected as exc:
+        raise _rejected(exc)
     return {"id": plan.id, **result}
+
 
 @router.get("/latest")
 def latest(hall_id: int = 1, db: Session = Depends(get_db)):
-    plan = db.scalars(select(SeatPlan).where(SeatPlan.hall_id == hall_id).order_by(SeatPlan.id.desc())).first()
+    plan = db.scalars(
+        select(SeatPlan).where(SeatPlan.hall_id == hall_id).order_by(SeatPlan.id.desc())
+    ).first()
     if not plan:
-        return run_seating(hall_id=hall_id, db=db)
+        # 尚无方案时按当前配置生成一份；失败则返回拒绝，不伪造空方案。
+        try:
+            plan, result = run_seating(db, hall_id)
+        except SeatingRejected as exc:
+            raise _rejected(exc)
+        return {"id": plan.id, **result}
+    # 历史方案：名额数字钉死在生成当时，不回刷为当前台账。
     data = json.loads(plan.result_json)
     return {"id": plan.id, **data}
+
 
 @router.get("/violations")
 def violations(hall_id: int = 1, db: Session = Depends(get_db)):
     data = latest(hall_id=hall_id, db=db)
-    return {"hall_id": hall_id, "violations": data.get("violations", []), "unplaced": data.get("unplaced", [])}
+    return {"hall_id": hall_id, "violations": data.get("violations", []),
+            "unplaced": data.get("unplaced", [])}
+
 
 @router.get("/stats")
 def stats(hall_id: int = 1, db: Session = Depends(get_db)):
     data = latest(hall_id=hall_id, db=db)
-    return {"hall_id": hall_id, **data.get("stats", {})}
+    stats = dict(data.get("stats", {}))
+    # 统计页的前排占用与名额已耗取同一套数（同源于方案快照）
+    stats["quota"] = data.get("quota", {})
+    return {"hall_id": hall_id, **stats}
